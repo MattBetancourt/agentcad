@@ -1,24 +1,88 @@
-# agentcad
+# CLAUDE.md
 
-agentcad is a local CLI and MCP server for AI-agent CAD workflows.
+## What this fork is
 
-## Repo Identity
+A personal fork of [`jdilla1277/agentcad`](https://github.com/jdilla1277/agentcad)
+(owner: Matt, GitHub `MattBetancourt`), created to fix a real Linux rendering
+crash. Goal is to eventually contribute the fix upstream (to agentcad and/or
+its `CadQuery/OCP` dependency) once better understood — this is not intended
+as a permanent divergent fork.
 
-This checkout is the **public** `jdilla1277/agentcad` repo. It is for
-externally safe package code, public docs, and examples.
+Remotes: `origin` = `jdilla1277/agentcad` (canonical upstream), `fork` =
+`MattBetancourt/agentcad` (this fork's push target).
 
-Do **not** open PRs here for internal planning material: PRDs, roadmap notes,
-marketing drafts, promotional plans, feedback logs, launch notes, private
-operational context, or anything that should not be public.
+## The bug
 
-If the user asks for internal planning, promotion work, or website work for
-`agentcad.dev`, use the internal repo (`jdilla1277/agentcad-internal`) instead.
-Before creating any PR, run `git remote -v` and confirm whether the target repo
-is public or internal.
+On Linux, `agentcad run --render`/`--preview` crashes with `X Error:
+BadWindow (invalid Window parameter)` from `X_GetWindowAttributes`. Root
+cause: OCCT's `OpenGl_GraphicDriver`/`Aspect_NeutralWindow` GLX context
+creation fails (`Aspect_GraphicDeviceDefinitionError:
+OpenGl_Window::CreateWindow: XGetVisualInfo is unable to choose needed
+configuration in existing OpenGL context`). Xlib's default error handler
+calls C `exit()` on `BadWindow`, so this doesn't just fail the render — it
+hard-kills the whole process, silently desyncing agentcad's version registry
+(everything after the render call in `_run_impl`, including
+`save_manifest()`, never runs).
 
-## Development
+Not Wayland-specific — reproduces identically under a real Xvfb X11 server.
+Not version-specific either: confirmed by direct reproduction (a minimal
+6-call script, no agentcad/build123d involved) that this crash is present in
+the *current* `cadquery-ocp` release (`7.9.3.1.1`), not just the older
+`7.8.1.1` this fork's upstream is pinned to — so upgrading the pin alone
+would not fix it. `cadquery-ocp` is built from `CadQuery/OCP`, not
+`tpaviot/pythonocc-core` (a separate, unrelated set of OCCT bindings —
+don't cite pythonocc-core issues as precedent for this, that was an earlier
+mistake corrected after checking). No matching issue exists in `CadQuery/OCP`
+either way, so there's no documented upstream maintainer stance on this bug
+at all yet.
 
-Use Python 3.10-3.12. CadQuery/OpenCascade does not support Python 3.13+.
+## The fix
+
+Branch `fix/linux-glx-offscreen-render-fallback`, 3 commits, all touching
+only `src/agentcad/render.py`:
+
+1. `80193b8` — non-fatal `XSetErrorHandler` (via ctypes) so `BadWindow`
+   raises a catchable Python exception instead of killing the process; a
+   VTK-based offscreen fallback (`vtkRenderWindow` +
+   `SetOffScreenRendering(1)`) used when the OCCT/GLX path raises, wrapping
+   `render_shape`/`render_shape_batch`/`render_shape_custom`.
+2. `0f6dd20` — scoped the error handler to just the render call via a
+   context manager (not global at import time, so agentcad-as-a-library
+   doesn't permanently swallow a host application's own X11 errors); logs
+   the OCCT exception to stderr before falling back instead of swallowing
+   it silently.
+3. `a61bdfa` — guards the fallback's `import vtk`. vtk isn't a declared
+   agentcad dependency — it's present today only transitively via
+   `cadquery-ocp==7.8.1.1`'s own dependency on `vtk==9.3.1` (see the
+   `build123d<0.11` cap in `pyproject.toml`). If agentcad ever moves to
+   `cadquery-ocp-novtk`, vtk could vanish; the guard raises a clear
+   `RuntimeError` instead of a bare `ModuleNotFoundError`.
+
+The VTK fallback also needed explicit lighting (key+fill lights plus an
+ambient brightness floor) — an earlier version relied on VTK's automatic
+default light, which rendered axis-aligned views with solid-black unlit
+faces.
+
+## Verified vs. still open
+
+Verified: reproduces under a real Xvfb X11 server (not Wayland-specific);
+still present on the current `cadquery-ocp` release (7.9.3.1.1), not just
+the pinned 7.8.1.1, via a minimal OCP-only repro independent of agentcad;
+agentcad's own CI (`.github/workflows/smoke.yml`) never exercises
+`tests/test_render.py` / `tests_b3d/test_render_cmd.py` on either runner it
+has (`ubuntu-22.04`, `windows-latest`) — so this exact code path isn't
+covered there either.
+
+Open / not yet done:
+- `commands/run.py` itself is untouched — an exception that escapes *both*
+  the OCCT path and the VTK fallback still desyncs a run, just for a
+  narrower set of triggers than before.
+- Not yet opened as a PR or issue upstream; reported so far only via
+  agentcad's own `agentcad feedback` command.
+- Untested on macOS/Windows — genuinely unknown whether either is affected,
+  since CI has no macOS runner and Windows CI doesn't run the render tests.
+
+## Upstream dev conventions (kept from original CLAUDE.md)
 
 ```bash
 python3.12 -m venv .venv
@@ -27,78 +91,7 @@ pip install -e ".[mcp,dev]"
 pytest
 ```
 
-## Product Contract
-
-- Commands return structured JSON.
-- `agentcad run` creates versioned output directories and records metadata.
-- `agentcad docs` and `agentcad --help` are part of the agent-facing API.
+- Python 3.10–3.12 only (CadQuery/OpenCascade doesn't support 3.13+).
+- Commands return structured JSON on stdout; human-readable diagnostics go
+  to stderr — don't merge the streams before parsing.
 - Keep error messages concise and actionable for coding agents.
-- Prefer local, deterministic workflows over hosted dependencies.
-
-## Validation
-
-For changes to agent-facing contracts, CLI workflows, docs/help output, viewer
-behavior, or app-like user flows, run a narrow sub-agent friction check before
-opening or finalizing the PR. Ask the sub-agent to behave like a fresh agent:
-read the docs, use the feature end-to-end in a scratch project, and report
-confusing behavior or mismatches between docs and reality.
-
-When output semantics can change the agent's next action, pre-register the
-expected behaviors before collecting responses. Use both a targeted
-comprehension prompt and a neutral, open-ended workflow prompt when the risk
-warrants it. Explicit questions can prove that the output supports a correct
-interpretation; they do not prove that an agent will apply that interpretation
-without prompting.
-
-For geometry comparison or validation, pair synthetic primitive tests with at
-least one real workflow artifact that preserves the topology and container
-shape agents actually produce, such as compounds or multi-solid outputs. A
-Boolean that works for one closed primitive may behave differently for the
-same occupied geometry wrapped in a compound.
-
-Keep friction artifacts under `.context/` unless they are intentional public
-fixtures. When validating unmerged CLI behavior, avoid stale installed code and
-stale daemons: use the current checkout (`PYTHONPATH=src` or editable install)
-and pass `--no-daemon` for command behavior checks.
-
-## Explaining Your Work
-
-When summarizing a change, bug, or design decision for the user, use simple,
-concrete language. Mechanism-first jargon is the failure mode.
-
-- Order: what the feature does for the user → what went wrong and what it
-  would cause → the fix. Consequence before mechanism.
-- Describe geometry and data physically before naming APIs: "two separate
-  solids in one container, like LEGO pieces in a bag — not glued together"
-  beats "a TopoDS_Compound with non-manifold member interfaces".
-- State consequences concretely: "an agent trusting that number would revert
-  a correct edit", not "produces incorrect results".
-- Give the fix one line of intuition ("the comparison cares about occupied
-  space, not how the model is bookkept into pieces") before any detail.
-- Keep OCCT/library class names out of the explanation unless the reader
-  needs them to act; plain terms ("the overlap math") carry the meaning.
-
-## Fork PRs
-
-External contributors submit PRs from forks. When acting as maintainer on one:
-
-- Check the head repo before pushing follow-up commits:
-  `gh pr view <N> --json headRepositoryOwner,maintainerCanModify`.
-  Pushing `origin HEAD:<branch>` creates a stray branch on this repo instead
-  of updating the PR — push to the fork instead:
-  `git push https://github.com/<owner>/agentcad.git HEAD:<branch>`
-  (allowed when the PR has maintainer edits enabled).
-- Fork-PR CI runs may be held at `action_required` awaiting maintainer
-  approval, and `gh pr checks` misleadingly reports "no checks reported".
-  Find the held run with
-  `gh api "repos/jdilla1277/agentcad/actions/runs?head_sha=<sha>"` and approve
-  it with `gh api -X POST repos/jdilla1277/agentcad/actions/runs/<id>/approve`.
-- `main` requires green checks and an up-to-date branch (branch protection,
-  admins included). If main moves under a fork PR, merge main into the branch
-  and push that to the fork.
-
-## Public Repo Rules
-
-- Do not add internal PRDs, roadmap notes, marketing drafts, feedback logs, secrets, or private operational context.
-- Keep examples and docs safe for public users.
-- Keep generated artifacts out of git unless they are intentional fixtures.

@@ -1,4 +1,9 @@
-# agentcad
+# agentcad (fork)
+
+> **This is a personal fork**, maintained by Matt ([`MattBetancourt`](https://github.com/MattBetancourt)),
+> of the canonical project: **[jdilla1277/agentcad](https://github.com/jdilla1277/agentcad)**.
+> It exists to fix one specific Linux crash (below). For anything else —
+> general use, issues, contributions — go to the upstream repo.
 
 **CAD tool for AI agents.** Give your coding agent the ability to design 3D models.
 
@@ -6,21 +11,43 @@ Your agent writes build123d Python scripts by default. agentcad handles executio
 
 > **Reading the output:** the JSON response is written to **stdout**; human-readable progress and diagnostics go to **stderr**. Parse stdout as JSON and treat stderr as plain text — don't merge the streams with `2>&1` before a JSON parser, or the progress lines will break parsing. If you need both, capture them separately.
 
-agentcad is open source under the Apache License 2.0. It runs locally and requires no signup.
+## Why this fork exists
 
-[![Featured on Product Hunt](https://api.producthunt.com/widgets/embed-image/v1/featured.svg?post_id=1165633&theme=light)](https://www.producthunt.com/products/agentcad?utm_source=badge-featured&utm_medium=badge&utm_campaign=badge-agentcad)
+On Linux, `agentcad run --render`/`--preview` crashes with `X Error: BadWindow
+(invalid Window parameter)`. The root cause is that OCCT's GLX offscreen
+context creation fails, and Xlib's default X11 error handler calls C `exit()`
+on that error — so it doesn't just fail the render, it hard-kills the whole
+`agentcad run` process partway through, silently desyncing agentcad's version
+registry (everything after the render call, including saving the run
+manifest, never executes). This fork adds a non-fatal X11 error handler
+(scoped to just the render call) plus a VTK-based offscreen rendering
+fallback for when the OCCT/GLX path fails.
 
-## Demo
+## What's different from upstream
 
-[![Watch a coding agent design in agentcad](https://img.youtube.com/vi/Zsn31-IilWM/maxresdefault.jpg)](https://www.youtube.com/watch?v=Zsn31-IilWM)
+Everything lives on branch [`fix/linux-glx-offscreen-render-fallback`](https://github.com/MattBetancourt/agentcad/tree/fix/linux-glx-offscreen-render-fallback),
+three commits, all touching only `src/agentcad/render.py`:
 
-A coding agent designing in agentcad, live. See more at [agentcad.dev](https://agentcad.dev).
+- [`80193b8`](https://github.com/MattBetancourt/agentcad/commit/80193b8) — non-fatal X11 error handler + VTK offscreen fallback
+- [`0f6dd20`](https://github.com/MattBetancourt/agentcad/commit/0f6dd20) — scope the error handler to just the render call; log the fallback reason instead of swallowing it
+- [`a61bdfa`](https://github.com/MattBetancourt/agentcad/commit/a61bdfa) — guard the fallback's (currently transitive, not declared) `vtk` import
 
-### Introducing parts
+Full diff: `git diff main fix/linux-glx-offscreen-render-fallback -- src/agentcad/render.py`.
+See `CLAUDE.md` in this repo for the fuller technical writeup.
 
-[![Watch agentcad parts rebuild a toy assembly](https://img.youtube.com/vi/VdMhRUiCaNU/maxresdefault.jpg)](https://youtu.be/VdMhRUiCaNU)
+## Status
 
-Parts let an agent build CAD as named, color-coded pieces and groups, then hand back a viewer a human can inspect. Watch the demo on [YouTube](https://youtu.be/VdMhRUiCaNU) or read the story at [agentcad.dev/parts](https://agentcad.dev/parts).
+**Works** for the case it was built for: Linux/WSL, `agentcad run --render`/`--preview`.
+
+**Open questions, stated plainly:**
+- Not yet submitted upstream as a PR or issue — reported so far only via
+  agentcad's own `agentcad feedback` command.
+- `commands/run.py` is untouched. An exception that escapes *both* the OCCT
+  path and the new VTK fallback still desyncs a run, just for a narrower set
+  of triggers than before this fix.
+- Untested on macOS and Windows. Genuinely unknown whether either is
+  affected — agentcad's CI has no macOS runner, and its Windows job doesn't
+  exercise the render code path either.
 
 ## Quick start
 
@@ -42,6 +69,14 @@ CadQuery compatibility.
 Then design me a phone stand: a simple angled cradle that holds a phone
 at 60 degrees. About 80mm wide, 50mm deep, with a 5mm lip at the bottom
 to keep the phone from sliding. Show me a preview when you're done.
+```
+
+`pip install agentcad` installs the **upstream** release from PyPI, not this
+fork's fix. To use this fork's fix before it's merged upstream, install from
+this branch instead:
+
+```bash
+pip install "git+https://github.com/MattBetancourt/agentcad.git@fix/linux-glx-offscreen-render-fallback"
 ```
 
 ## What it does
@@ -119,8 +154,12 @@ Add to `.mcp.json`:
 
 ## License
 
-Apache License 2.0. See [LICENSE](LICENSE).
+Apache License 2.0. See [LICENSE](LICENSE). Same license as upstream; this
+fork changes nothing about it.
 
 ## Feedback
 
+For this fork's fix specifically, open an issue against
+[`MattBetancourt/agentcad`](https://github.com/MattBetancourt/agentcad). For
+everything else, use upstream: [`jdilla1277/agentcad`](https://github.com/jdilla1277/agentcad).
 If your agent struggles, run `agentcad feedback "what happened"` to capture a friction log.
