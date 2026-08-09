@@ -28,6 +28,196 @@ from OCP.gp import gp_Dir
 
 from agentcad.export import _GLB_PALETTE, _parse_color
 
+import ctypes
+
+try:
+    libX11 = ctypes.CDLL("libX11.so.6")
+    _CMPFUNC = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p)
+    def _x_error_handler(display, error_event):
+        return 0
+    _x11_error_handler_cb = _CMPFUNC(_x_error_handler)
+    libX11.XSetErrorHandler(_x11_error_handler_cb)
+except Exception:
+    pass
+
+
+def _render_vtk_batch_fallback(shape, view_specs, output_paths, width=512, height=512):
+    import vtk
+    from OCP.BRepMesh import BRepMesh_IncrementalMesh
+    from OCP.TopExp import TopExp_Explorer
+    from OCP.TopAbs import TopAbs_FACE, TopAbs_REVERSED
+    from OCP.BRep import BRep_Tool
+    from OCP.TopLoc import TopLoc_Location
+    from OCP.TopoDS import TopoDS
+    import math
+
+    BRepMesh_IncrementalMesh(shape, 0.1)
+
+    points = vtk.vtkPoints()
+    polys = vtk.vtkCellArray()
+
+    # BRep_Tool.Triangulation_s always returns triangles wound for the face's
+    # natural (forward) orientation. A face marked TopAbs_REVERSED in the BREP
+    # (common after booleans/fillets -- this bracket's own topology has 5 of 16
+    # faces reversed) needs its winding flipped too, or its triangles end up
+    # with inward-facing normals: fine in OCCT's own renderer (which reads
+    # Orientation() when shading) but wrong here, since VTK computes normals
+    # purely from winding order. Unflipped, those faces render solid black in
+    # any view where they're seen close to head-on.
+    explorer = TopExp_Explorer(shape, TopAbs_FACE)
+    offset = 0
+    while explorer.More():
+        face = TopoDS.Face_s(explorer.Current())
+        reversed_face = face.Orientation() == TopAbs_REVERSED
+        loc = TopLoc_Location()
+        tri = BRep_Tool.Triangulation_s(face, loc)
+        if tri is not None:
+            trsf = loc.Transformation()
+            for i in range(1, tri.NbNodes() + 1):
+                p = tri.Node(i).Transformed(trsf)
+                points.InsertNextPoint(p.X(), p.Y(), p.Z())
+            for i in range(1, tri.NbTriangles() + 1):
+                t = tri.Triangle(i)
+                n1, n2, n3 = t.Get()
+                if reversed_face:
+                    n2, n3 = n3, n2
+                polys.InsertNextCell(3)
+                polys.InsertCellPoint(offset + n1 - 1)
+                polys.InsertCellPoint(offset + n2 - 1)
+                polys.InsertCellPoint(offset + n3 - 1)
+            offset += tri.NbNodes()
+        explorer.Next()
+
+    polydata = vtk.vtkPolyData()
+    polydata.SetPoints(points)
+    polydata.SetPolys(polys)
+
+    # No normals array is attached above, and this polydata's mapper has
+    # nothing else to derive lighting from except VTK's on-the-fly
+    # screen-space normal estimation -- which is numerically degenerate for
+    # any flat face that lands exactly perpendicular to the camera (zero
+    # screen-space depth gradient across the face). That's precisely an
+    # axis-aligned view (front/top/etc.) of a flat solid, and it renders as
+    # solid black. Computing real analytic normals up front avoids relying on
+    # that estimation at all. ConsistencyOn()/AutoOrientNormalsOn() also
+    # correct any faces whose triangle winding doesn't match their BREP
+    # Orientation() (this shape's own topology has 5 of 16 faces reversed).
+    normals_filter = vtk.vtkPolyDataNormals()
+    normals_filter.SetInputData(polydata)
+    normals_filter.ComputePointNormalsOn()
+    normals_filter.ComputeCellNormalsOn()
+    normals_filter.ConsistencyOn()
+    normals_filter.AutoOrientNormalsOn()
+    normals_filter.SplittingOff()
+    normals_filter.Update()
+    polydata = normals_filter.GetOutput()
+
+    bounds = [0]*6
+    polydata.GetBounds(bounds)
+    cx = (bounds[0] + bounds[1])/2
+    cy = (bounds[2] + bounds[3])/2
+    cz = (bounds[4] + bounds[5])/2
+    dist = max(bounds[1]-bounds[0], bounds[3]-bounds[2], bounds[5]-bounds[4]) * 1.5
+    if dist < 1e-6:
+        dist = 10.0
+
+    mapper = vtk.vtkPolyDataMapper()
+    mapper.SetInputData(polydata)
+
+    actor = vtk.vtkActor()
+    actor.SetMapper(mapper)
+    actor.GetProperty().SetColor(0.8, 0.8, 0.8)
+    # A pure directional/positional vtkLight can leave a face at exactly
+    # zero illumination if its normal happens to be perpendicular (or worse,
+    # opposed) to every light in the rig -- exactly what happened above with
+    # a degenerate zero-length "ambient" light direction. Rather than chase
+    # light-vector geometry until every possible face orientation is covered,
+    # give the material itself a guaranteed brightness floor: no face can
+    # render pure black regardless of light placement. (OCCT's own renderer
+    # gets the equivalent of this for free from its V3d_AmbientLight, which
+    # is a true non-directional ambient term with no "wrong angle" case.)
+    actor.GetProperty().SetAmbient(0.35)
+    actor.GetProperty().SetDiffuse(0.65)
+
+    renderer = vtk.vtkRenderer()
+    renderer.AddActor(actor)
+    renderer.SetBackground(0.96, 0.96, 0.96) # match (245,245,245) or close to it
+
+    # No explicit light was ever added here -- this relied entirely on VTK's
+    # automatic default headlight (vtkRenderer.AutomaticLightCreation, on by
+    # default), which is only created/repositioned relative to the CURRENT
+    # camera at Render() time. Mirror the OCCT path's own fixed-in-world-space
+    # key+fill lights (see _setup_render above) instead, so lighting doesn't
+    # depend on happening to line up with the camera for each of the 7 views
+    # rendered from this one reused renderer. The ambient contribution above
+    # (actor.Property.Ambient) replaces OCCT's V3d_AmbientLight -- a real
+    # vtkLight can't represent non-directional ambient the same way.
+    renderer.SetAutomaticLightCreation(False)
+    key_light = vtk.vtkLight()
+    key_light.SetLightTypeToSceneLight()
+    key_light.SetPositional(False)
+    key_light.SetPosition(1, -1, -1)
+    key_light.SetFocalPoint(0, 0, 0)
+    key_light.SetIntensity(0.8)
+    renderer.AddLight(key_light)
+    fill_light = vtk.vtkLight()
+    fill_light.SetLightTypeToSceneLight()
+    fill_light.SetPositional(False)
+    fill_light.SetPosition(-1, 1, 0.5)
+    fill_light.SetFocalPoint(0, 0, 0)
+    fill_light.SetIntensity(0.4)
+    renderer.AddLight(fill_light)
+
+    window = vtk.vtkRenderWindow()
+    window.SetOffScreenRendering(1)
+    window.SetSize(width, height)
+    window.AddRenderer(renderer)
+    
+    VIEWS = {
+        "front": (0, -1, 0),
+        "back": (0, 1, 0),
+        "left": (-1, 0, 0),
+        "right": (1, 0, 0),
+        "top": (0, 0, 1),
+        "bottom": (0, 0, -1),
+        "iso": (1, -1, 1),
+    }
+
+    for spec, out_path in zip(view_specs, output_paths):
+        camera = renderer.GetActiveCamera()
+        camera.SetFocalPoint(cx, cy, cz)
+        
+        if isinstance(spec, str):
+            dx, dy, dz = VIEWS.get(spec, (1, -1, 1))
+        else:
+            az, el = spec
+            az_r = math.radians(az)
+            el_r = math.radians(el)
+            dx = -math.sin(az_r) * math.cos(el_r)
+            dy = math.cos(az_r) * math.cos(el_r)
+            dz = -math.sin(el_r)
+        
+        l = math.hypot(dx, dy, dz)
+        if l > 0: dx, dy, dz = dx/l, dy/l, dz/l
+        
+        camera.SetPosition(cx + dx*dist, cy + dy*dist, cz + dz*dist)
+        
+        if abs(dz) > 0.99:
+            camera.SetViewUp(0, 1, 0)
+        else:
+            camera.SetViewUp(0, 0, 1)
+            
+        renderer.ResetCamera()
+        window.Render()
+        
+        window_filter = vtk.vtkWindowToImageFilter()
+        window_filter.SetInput(window)
+        window_filter.Update()
+        writer = vtk.vtkPNGWriter()
+        writer.SetFileName(str(out_path))
+        writer.SetInputConnection(window_filter.GetOutputPort())
+        writer.Write()
+
 VIEWS = {
     "front": V3d_TypeOfOrientation_Zup_Front,
     "back": V3d_TypeOfOrientation_Zup_Back,
@@ -193,13 +383,16 @@ def _apply_camera(view, zoom, focus, fit):
 def render_shape(shape, view_name, output_path, width=800, height=600,
                  zoom=1.0, focus=None, fit=True, parts=None, msaa=0):
     """Render a TopoDS_Shape to a PNG file from the given view."""
-    orientation = VIEWS[view_name]
-    view, _ctx = _setup_render(shape, width, height, parts=parts, msaa=msaa)
+    try:
+        orientation = VIEWS[view_name]
+        view, _ctx = _setup_render(shape, width, height, parts=parts, msaa=msaa)
 
-    view.SetProj(orientation)
-    _apply_camera(view, zoom, focus, fit)
+        view.SetProj(orientation)
+        _apply_camera(view, zoom, focus, fit)
 
-    _capture(view, output_path, width, height, msaa=msaa)
+        _capture(view, output_path, width, height, msaa=msaa)
+    except Exception:
+        _render_vtk_batch_fallback(shape, [view_name], [output_path], width=width, height=height)
 
 
 def render_shape_batch(shape, view_specs, output_paths, width=512, height=512,
@@ -218,22 +411,25 @@ def render_shape_batch(shape, view_specs, output_paths, width=512, height=512,
         width, height: Per-view dimensions in pixels.
         msaa: Number of multisample antialiasing samples; 0 disables MSAA.
     """
-    view, _ctx = _setup_render(shape, width, height, parts=parts, msaa=msaa)
-    for spec, out_path in zip(view_specs, output_paths):
-        if isinstance(spec, str):
-            view.SetProj(VIEWS[spec])
-        else:
-            az, el = spec
-            az_r = math.radians(az)
-            el_r = math.radians(el)
-            vx = -math.sin(az_r) * math.cos(el_r)
-            vy = math.cos(az_r) * math.cos(el_r)
-            vz = -math.sin(el_r)
-            view.SetProj(vx, vy, vz)
-            view.SetUp(0, 0, 1)
-        view.FitAll()
-        view.Redraw()
-        _capture(view, out_path, width, height, msaa=msaa)
+    try:
+        view, _ctx = _setup_render(shape, width, height, parts=parts, msaa=msaa)
+        for spec, out_path in zip(view_specs, output_paths):
+            if isinstance(spec, str):
+                view.SetProj(VIEWS[spec])
+            else:
+                az, el = spec
+                az_r = math.radians(az)
+                el_r = math.radians(el)
+                vx = -math.sin(az_r) * math.cos(el_r)
+                vy = math.cos(az_r) * math.cos(el_r)
+                vz = -math.sin(el_r)
+                view.SetProj(vx, vy, vz)
+                view.SetUp(0, 0, 1)
+            view.FitAll()
+            view.Redraw()
+            _capture(view, out_path, width, height, msaa=msaa)
+    except Exception:
+        _render_vtk_batch_fallback(shape, view_specs, output_paths, width=width, height=height)
 
 
 # The default composite is one top-down layout view + three iso angles spaced
@@ -729,20 +925,23 @@ def render_shape_custom(shape, azimuth, elevation, output_path,
                         width=800, height=600, zoom=1.0, focus=None, fit=True,
                         parts=None, msaa=0):
     """Render a TopoDS_Shape to a PNG file from a custom azimuth/elevation angle."""
-    az = math.radians(azimuth)
-    el = math.radians(elevation)
+    try:
+        az = math.radians(azimuth)
+        el = math.radians(elevation)
 
-    vx = -math.sin(az) * math.cos(el)
-    vy = math.cos(az) * math.cos(el)
-    vz = -math.sin(el)
+        vx = -math.sin(az) * math.cos(el)
+        vy = math.cos(az) * math.cos(el)
+        vz = -math.sin(el)
 
-    view, _ctx = _setup_render(shape, width, height, parts=parts, msaa=msaa)
+        view, _ctx = _setup_render(shape, width, height, parts=parts, msaa=msaa)
 
-    view.SetProj(vx, vy, vz)
-    view.SetUp(0, 0, 1)
-    _apply_camera(view, zoom, focus, fit)
+        view.SetProj(vx, vy, vz)
+        view.SetUp(0, 0, 1)
+        _apply_camera(view, zoom, focus, fit)
 
-    _capture(view, output_path, width, height, msaa=msaa)
+        _capture(view, output_path, width, height, msaa=msaa)
+    except Exception:
+        _render_vtk_batch_fallback(shape, [(azimuth, elevation)], [output_path], width=width, height=height)
 
 
 def render_views(shape, view_names, output_dir):
