@@ -41,17 +41,17 @@ at all yet.
 Branch `fix/linux-glx-offscreen-render-fallback`, 3 commits, all touching
 only `src/agentcad/render.py`:
 
-1. `80193b8` — non-fatal `XSetErrorHandler` (via ctypes) so `BadWindow`
+1. `404092e` — non-fatal `XSetErrorHandler` (via ctypes) so `BadWindow`
    raises a catchable Python exception instead of killing the process; a
    VTK-based offscreen fallback (`vtkRenderWindow` +
    `SetOffScreenRendering(1)`) used when the OCCT/GLX path raises, wrapping
    `render_shape`/`render_shape_batch`/`render_shape_custom`.
-2. `0f6dd20` — scoped the error handler to just the render call via a
+2. `6a9f4b9` — scoped the error handler to just the render call via a
    context manager (not global at import time, so agentcad-as-a-library
    doesn't permanently swallow a host application's own X11 errors); logs
    the OCCT exception to stderr before falling back instead of swallowing
    it silently.
-3. `a61bdfa` — guards the fallback's `import vtk`. vtk isn't a declared
+3. `773c99e` — guards the fallback's `import vtk`. vtk isn't a declared
    agentcad dependency — it's present today only transitively via
    `cadquery-ocp==7.8.1.1`'s own dependency on `vtk==9.3.1` (see the
    `build123d<0.11` cap in `pyproject.toml`). If agentcad ever moves to

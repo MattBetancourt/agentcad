@@ -28,9 +28,9 @@ fallback for when the OCCT/GLX path fails.
 Everything lives on branch [`fix/linux-glx-offscreen-render-fallback`](https://github.com/MattBetancourt/agentcad/tree/fix/linux-glx-offscreen-render-fallback),
 three commits, all touching only `src/agentcad/render.py`:
 
-- [`80193b8`](https://github.com/MattBetancourt/agentcad/commit/80193b8) — non-fatal X11 error handler + VTK offscreen fallback
-- [`0f6dd20`](https://github.com/MattBetancourt/agentcad/commit/0f6dd20) — scope the error handler to just the render call; log the fallback reason instead of swallowing it
-- [`a61bdfa`](https://github.com/MattBetancourt/agentcad/commit/a61bdfa) — guard the fallback's (currently transitive, not declared) `vtk` import
+- [`404092e`](https://github.com/MattBetancourt/agentcad/commit/404092e) — non-fatal X11 error handler + VTK offscreen fallback
+- [`6a9f4b9`](https://github.com/MattBetancourt/agentcad/commit/6a9f4b9) — scope the error handler to just the render call; log the fallback reason instead of swallowing it
+- [`773c99e`](https://github.com/MattBetancourt/agentcad/commit/773c99e) — guard the fallback's (currently transitive, not declared) `vtk` import
 
 Full diff: `git diff main fix/linux-glx-offscreen-render-fallback -- src/agentcad/render.py`.
 See `CLAUDE.md` in this repo for the fuller technical writeup.
