@@ -1,4 +1,7 @@
+import contextlib
+import ctypes
 import math
+import sys
 from pathlib import Path
 
 from OCP.AIS import AIS_InteractiveContext, AIS_Shape
@@ -28,17 +31,55 @@ from OCP.gp import gp_Dir
 
 from agentcad.export import _GLB_PALETTE, _parse_color
 
-import ctypes
+_X11_ERRHANDLER_CFUNC = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p)
 
-try:
-    libX11 = ctypes.CDLL("libX11.so.6")
-    _CMPFUNC = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p)
-    def _x_error_handler(display, error_event):
-        return 0
-    _x11_error_handler_cb = _CMPFUNC(_x_error_handler)
-    libX11.XSetErrorHandler(_x11_error_handler_cb)
-except Exception:
-    pass
+
+def _x11_nonfatal_error_handler(display, error_event):
+    # Xlib's own default handler calls C exit() on protocol errors like
+    # BadWindow -- returning here instead of exiting is what turns that into
+    # a normal, catchable Python exception in the caller.
+    return 0
+
+
+@contextlib.contextmanager
+def _suppress_fatal_x11_errors():
+    """Install a non-fatal XSetErrorHandler for the duration of the `with`
+    block only, restoring whatever was previously installed on exit.
+
+    Scoped deliberately, rather than installed once at module-import time:
+    agentcad is sometimes used as a library, not just a CLI, and a global,
+    permanent XSetErrorHandler mutation would silently swallow X11 errors
+    for the *whole host process* -- including a consuming application's own
+    GUI, if it has one. Confining it to just the render call means agentcad
+    only overrides X11 error handling while it's actually the one making
+    X11/GLX calls.
+    """
+    try:
+        libX11 = ctypes.CDLL("libX11.so.6")
+        # Without explicit types, ctypes treats XSetErrorHandler's return
+        # (an XErrorHandler function pointer) as a plain c_int, truncating a
+        # 64-bit address on most platforms -- which would corrupt `previous`
+        # and crash on restore. c_void_p round-trips it correctly instead.
+        libX11.XSetErrorHandler.restype = ctypes.c_void_p
+        libX11.XSetErrorHandler.argtypes = [ctypes.c_void_p]
+    except Exception:
+        yield
+        return
+    callback = _X11_ERRHANDLER_CFUNC(_x11_nonfatal_error_handler)
+    try:
+        previous = libX11.XSetErrorHandler(
+            ctypes.cast(callback, ctypes.c_void_p)
+        )
+    except Exception:
+        yield
+        return
+    try:
+        yield
+    finally:
+        try:
+            libX11.XSetErrorHandler(previous)
+        except Exception:
+            pass
 
 
 def _render_vtk_batch_fallback(shape, view_specs, output_paths, width=512, height=512):
@@ -384,14 +425,18 @@ def render_shape(shape, view_name, output_path, width=800, height=600,
                  zoom=1.0, focus=None, fit=True, parts=None, msaa=0):
     """Render a TopoDS_Shape to a PNG file from the given view."""
     try:
-        orientation = VIEWS[view_name]
-        view, _ctx = _setup_render(shape, width, height, parts=parts, msaa=msaa)
+        with _suppress_fatal_x11_errors():
+            orientation = VIEWS[view_name]
+            view, _ctx = _setup_render(shape, width, height, parts=parts, msaa=msaa)
 
-        view.SetProj(orientation)
-        _apply_camera(view, zoom, focus, fit)
+            view.SetProj(orientation)
+            _apply_camera(view, zoom, focus, fit)
 
-        _capture(view, output_path, width, height, msaa=msaa)
-    except Exception:
+            _capture(view, output_path, width, height, msaa=msaa)
+    except Exception as e:
+        sys.stderr.write(
+            f"[agentcad] OCCT render failed ({e!r}), using VTK offscreen fallback\n"
+        )
         _render_vtk_batch_fallback(shape, [view_name], [output_path], width=width, height=height)
 
 
@@ -412,23 +457,27 @@ def render_shape_batch(shape, view_specs, output_paths, width=512, height=512,
         msaa: Number of multisample antialiasing samples; 0 disables MSAA.
     """
     try:
-        view, _ctx = _setup_render(shape, width, height, parts=parts, msaa=msaa)
-        for spec, out_path in zip(view_specs, output_paths):
-            if isinstance(spec, str):
-                view.SetProj(VIEWS[spec])
-            else:
-                az, el = spec
-                az_r = math.radians(az)
-                el_r = math.radians(el)
-                vx = -math.sin(az_r) * math.cos(el_r)
-                vy = math.cos(az_r) * math.cos(el_r)
-                vz = -math.sin(el_r)
-                view.SetProj(vx, vy, vz)
-                view.SetUp(0, 0, 1)
-            view.FitAll()
-            view.Redraw()
-            _capture(view, out_path, width, height, msaa=msaa)
-    except Exception:
+        with _suppress_fatal_x11_errors():
+            view, _ctx = _setup_render(shape, width, height, parts=parts, msaa=msaa)
+            for spec, out_path in zip(view_specs, output_paths):
+                if isinstance(spec, str):
+                    view.SetProj(VIEWS[spec])
+                else:
+                    az, el = spec
+                    az_r = math.radians(az)
+                    el_r = math.radians(el)
+                    vx = -math.sin(az_r) * math.cos(el_r)
+                    vy = math.cos(az_r) * math.cos(el_r)
+                    vz = -math.sin(el_r)
+                    view.SetProj(vx, vy, vz)
+                    view.SetUp(0, 0, 1)
+                view.FitAll()
+                view.Redraw()
+                _capture(view, out_path, width, height, msaa=msaa)
+    except Exception as e:
+        sys.stderr.write(
+            f"[agentcad] OCCT render failed ({e!r}), using VTK offscreen fallback\n"
+        )
         _render_vtk_batch_fallback(shape, view_specs, output_paths, width=width, height=height)
 
 
@@ -926,21 +975,25 @@ def render_shape_custom(shape, azimuth, elevation, output_path,
                         parts=None, msaa=0):
     """Render a TopoDS_Shape to a PNG file from a custom azimuth/elevation angle."""
     try:
-        az = math.radians(azimuth)
-        el = math.radians(elevation)
+        with _suppress_fatal_x11_errors():
+            az = math.radians(azimuth)
+            el = math.radians(elevation)
 
-        vx = -math.sin(az) * math.cos(el)
-        vy = math.cos(az) * math.cos(el)
-        vz = -math.sin(el)
+            vx = -math.sin(az) * math.cos(el)
+            vy = math.cos(az) * math.cos(el)
+            vz = -math.sin(el)
 
-        view, _ctx = _setup_render(shape, width, height, parts=parts, msaa=msaa)
+            view, _ctx = _setup_render(shape, width, height, parts=parts, msaa=msaa)
 
-        view.SetProj(vx, vy, vz)
-        view.SetUp(0, 0, 1)
-        _apply_camera(view, zoom, focus, fit)
+            view.SetProj(vx, vy, vz)
+            view.SetUp(0, 0, 1)
+            _apply_camera(view, zoom, focus, fit)
 
-        _capture(view, output_path, width, height, msaa=msaa)
-    except Exception:
+            _capture(view, output_path, width, height, msaa=msaa)
+    except Exception as e:
+        sys.stderr.write(
+            f"[agentcad] OCCT render failed ({e!r}), using VTK offscreen fallback\n"
+        )
         _render_vtk_batch_fallback(shape, [(azimuth, elevation)], [output_path], width=width, height=height)
 
 
