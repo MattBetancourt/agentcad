@@ -83,7 +83,28 @@ def _suppress_fatal_x11_errors():
 
 
 def _render_vtk_batch_fallback(shape, view_specs, output_paths, width=512, height=512):
-    import vtk
+    try:
+        import vtk
+    except ImportError as e:
+        # vtk isn't in this project's own dependencies -- it's present today
+        # only because cadquery-ocp==7.8.x (the build pinned by
+        # build123d<0.11, see the pyproject.toml comment on that cap)
+        # happens to declare vtk==9.3.1 itself. That cap exists to dodge an
+        # unrelated version conflict, and the same comment notes build123d
+        # 0.11+ moves to cadquery-ocp-novtk -- a VTK-free OCP build. If that
+        # cap is ever lifted, this import can start failing here. Surface
+        # that clearly rather than a bare ModuleNotFoundError deep in a
+        # fallback path whose whole point is being more reliable than what
+        # it's replacing.
+        raise RuntimeError(
+            "OCCT offscreen rendering failed, and the VTK fallback couldn't "
+            "load 'vtk' either. vtk is not a direct dependency of agentcad -- "
+            "it's currently pulled in transitively by cadquery-ocp==7.8.x "
+            "(pinned via the build123d<0.11 cap in pyproject.toml). If that "
+            "cap has since been lifted, vtk may no longer be installed; "
+            "either add vtk as an explicit dependency or reinstall against "
+            "an OCP build that still bundles it."
+        ) from e
     from OCP.BRepMesh import BRepMesh_IncrementalMesh
     from OCP.TopExp import TopExp_Explorer
     from OCP.TopAbs import TopAbs_FACE, TopAbs_REVERSED
